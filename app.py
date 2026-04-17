@@ -8,6 +8,7 @@ from flask import Flask, Response, render_template_string, jsonify, request, sen
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import torch
 import io
 import csv
 import os
@@ -41,15 +42,13 @@ CLASS_NAMES = model.names
 WEAPON_CLASSES = {"gun", "pistol", "rifle", "knife", "Knife", "weapon", "guns"}
 MILITARY_WEAPON_CLASSES = {"rifle", "gun", "guns"}  # person + these → military personnel
 
-# Lightweight pre-filter: skip the heavy weapon model on frames that contain no persons.
-# yolo12n.pt is the COCO nano model (~4 MB). Ultralytics auto-downloads it on first run.
-_person_model_path = os.path.join(BASE_DIR, "yolo12n.pt")
-person_model = YOLO(_person_model_path if os.path.exists(_person_model_path) else "yolo12n.pt")
+# ── Low-spec tuning (4 GB RAM / i5 4th gen) ─────────────────────────────────
+# Limit PyTorch to 2 threads — leaves 2 cores free for OS/Flask/camera.
+torch.set_num_threads(2)
 
-# ── RPi performance knobs ────────────────────────────────────────────────────
-_INFER_SIZE   = 320   # YOLO input resolution; 320 ≈ 4× faster than 640
-_INFER_EVERY  = 2     # run full inference every N frames; reuse boxes otherwise
-_JPEG_QUALITY = 65    # JPEG encode quality (65 is fine for surveillance)
+_INFER_SIZE   = 256   # YOLO input (256 = fastest; min recommended for detection)
+_INFER_EVERY  = 4     # run inference every 4 frames, reuse boxes in between
+_JPEG_QUALITY = 50    # lower encode cost; still clear enough for surveillance
 
 # ── Shared MJPEG frame buffer ────────────────────────────────────────────────
 # One inference loop runs in a background thread; all HTTP clients read from
@@ -58,12 +57,11 @@ _frame_lock  = threading.Lock()
 _latest_jpeg = b''
 
 # ── Model warm-up (eliminates first-frame latency on RPi) ───────────────────
-print("  Warming up models...", flush=True)
-_warmup = np.zeros((480, 640, 3), dtype=np.uint8)
-person_model.predict(_warmup, imgsz=_INFER_SIZE, verbose=False)
+print("  Warming up model...", flush=True)
+_warmup = np.zeros((360, 480, 3), dtype=np.uint8)
 model.predict(_warmup, imgsz=_INFER_SIZE, verbose=False)
 del _warmup
-print("  Models ready.", flush=True)
+print("  Model ready.", flush=True)
 
 # ---- Shared state ----
 state_lock = threading.Lock()
@@ -73,7 +71,7 @@ state = {
     "alert": False,
     "conf_threshold": 0.35,
     "total_weapons_seen": 0,
-    "events": deque(maxlen=200),  # full log; UI shows last 20
+    "events": deque(maxlen=50),   # trimmed for low-RAM device
     "last_snapshot_time": 0,
     "view_mode": "normal",        # normal | night | thermal | gray
     "vehicle_speed": 220,         # 0-255 PWM for drive motors
@@ -116,6 +114,7 @@ def init_serial():
     try:
         arduino = serial.Serial(port, SERIAL_BAUD, timeout=0.1)
         time.sleep(2)  # let the board reset after DTR pulse
+        arduino.reset_input_buffer()  # discard Arduino startup banner
         print(f"  [serial] Connected → {port} @ {SERIAL_BAUD} baud")
     except Exception as e:
         print(f"  [serial] Failed to open {port}: {e}")
@@ -1209,11 +1208,11 @@ def _inference_loop():
         print("  [camera] PiCamera2 active (640×480)", flush=True)
     except Exception:
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS,          30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # ← critical on RPi: prevents stale frames
-        print("  [camera] OpenCV VideoCapture (640×480)", flush=True)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        cap.set(cv2.CAP_PROP_FPS,          15)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        print("  [camera] OpenCV VideoCapture (480x360 @ 15fps)", flush=True)
 
     fps_time    = time.time()
     frame_count = 0
@@ -1243,24 +1242,19 @@ def _inference_loop():
 
         # ── Inference (every _INFER_EVERY frames) ────────────────────────────
         if run_infer:
-            fast_r = person_model.predict(
-                frame, conf=0.4, classes=[0], imgsz=_INFER_SIZE, verbose=False)[0]
-            has_person = len(fast_r.boxes) > 0
-
             weapon_boxes: list = []
             person_boxes: list = []
-            if has_person:
-                results = model.predict(
-                    frame, conf=conf, imgsz=_INFER_SIZE, verbose=False)
-                r = results[0]
-                for box in r.boxes:
-                    cls_name   = r.names[int(box.cls)]
-                    confidence = float(box.conf)
-                    xyxy       = box.xyxy[0].cpu().numpy().tolist()
-                    if cls_name in WEAPON_CLASSES:
-                        weapon_boxes.append((xyxy, cls_name, confidence))
-                    elif cls_name == "person":
-                        person_boxes.append(xyxy)
+            results = model.predict(
+                frame, conf=conf, imgsz=_INFER_SIZE, verbose=False)
+            r = results[0]
+            for box in r.boxes:
+                cls_name   = r.names[int(box.cls)]
+                confidence = float(box.conf)
+                xyxy       = box.xyxy[0].cpu().numpy().tolist()
+                if cls_name in WEAPON_CLASSES:
+                    weapon_boxes.append((xyxy, cls_name, confidence))
+                elif cls_name == "person":
+                    person_boxes.append(xyxy)
             last_weapon_boxes = weapon_boxes
             last_person_boxes = person_boxes
         else:
@@ -1497,19 +1491,20 @@ def serial_status():
 @app.route('/serial_reconnect')
 def serial_reconnect():
     global arduino
-    if arduino is not None:
-        try:
-            arduino.close()
-        except Exception:
-            pass
-        arduino = None
+    with arduino_lock:
+        if arduino is not None:
+            try:
+                arduino.close()
+            except Exception:
+                pass
+            arduino = None
     init_serial()
     connected = arduino is not None
     port = arduino.port if connected else ""
     return jsonify({"connected": connected, "port": port})
 
 
-VEHICLE_CHARS = set("FBLRWGHIJ")  # forward/back/left/right/stop + diagonals
+VEHICLE_CHARS = set("FBLRWGHIJPOC")  # movement + diagonals + arm home/gripper open/close
 
 
 @app.route('/cmd')
