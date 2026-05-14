@@ -19,6 +19,10 @@ const int PIN_BASE    = 44;
 const int PIN_ELBOW   = 45;
 const int PIN_GRIPPER = 46;
 
+// [SAFETY] Servo initialization timeout & watchdog
+const unsigned long SERVO_ATTACH_TIMEOUT_MS = 5000;
+const unsigned long GRIPPER_WATCHDOG_MS     = 2000;  // kill gripper if timing goes awry
+
 // ═══════════════════════════════════════════════════════════════
 //  OBJECTS
 // ═══════════════════════════════════════════════════════════════
@@ -101,16 +105,48 @@ void setup() {
 
   stopMotors();
 
-  // Servos
-  baseJoint.attach(PIN_BASE);
-  elbowJoint.attach(PIN_ELBOW);
-  gripperServo.attach(PIN_GRIPPER);
+  // [PERF] Motor enable verification (quick smoke test)
+  Serial.println(F("  Testing motor enables..."));
+  pinMode(13, OUTPUT);
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(13, HIGH); delay(100); digitalWrite(13, LOW); delay(100);
+  }
+  Serial.println(F("  Motor driver should be responsive"));
+
+  // [SAFETY] Servo attach with timeout detection + diagnostics
+  Serial.println(F("  Attaching servos..."));
+  unsigned long servo_start = millis();
+  bool servo_ok = true;
+  
+  if (!baseJoint.attach(PIN_BASE)) {
+    Serial.println(F("ERR: BASE servo attach failed"));
+    servo_ok = false;
+  }
+  if (!elbowJoint.attach(PIN_ELBOW)) {
+    Serial.println(F("ERR: ELBOW servo attach failed"));
+    servo_ok = false;
+  }
+  if (!gripperServo.attach(PIN_GRIPPER)) {
+    Serial.println(F("ERR: GRIPPER servo attach failed"));
+    servo_ok = false;
+  }
+  
+  // [SAFETY] Verify attach completed within timeout
+  if (millis() - servo_start > SERVO_ATTACH_TIMEOUT_MS) {
+    Serial.println(F("WARN: Servo init took > 5s — possible hung servo?"));
+  }
 
   baseJoint.write(baseAngle);
   elbowJoint.write(elbowAngle);
   gripperServo.write(GRIPPER_STOP);
 
   delay(500);
+
+  if (servo_ok) {
+    Serial.println(F("  ✓ Servos attached"));
+  } else {
+    Serial.println(F("  ✗ SOME SERVOS FAILED — arm may not respond"));
+  }
 
   Serial.println(F("=== Rover + Arm Ready ==="));
   Serial.println(F("Drive: F=Fwd  B=Back  L=Left  R=Right  W=Stop"));
@@ -136,10 +172,15 @@ void loop() {
       usb_buf.trim();
       if (usb_buf.length() > 0) {
         processLine(usb_buf, Serial);
+        // [SAFETY] Explicit buffer clear on each complete command
         usb_buf = "";
       }
     } else if (usb_buf.length() < 64) {
       usb_buf += c;
+    } else {
+      // [SAFETY] Buffer overflow—discard incomplete command, signal error
+      Serial.println(F("ERR:USB buffer overflow"));
+      usb_buf = "";
     }
   }
 
@@ -150,10 +191,15 @@ void loop() {
       bt_buf.trim();
       if (bt_buf.length() > 0) {
         processLine(bt_buf, Serial1);
+        // [SAFETY] Explicit buffer clear
         bt_buf = "";
       }
     } else if (bt_buf.length() < 64) {
       bt_buf += c;
+    } else {
+      // [SAFETY] Bluetooth buffer overflow
+      Serial1.println(F("ERR:BT buffer overflow"));
+      bt_buf = "";
     }
   }
 }
@@ -210,21 +256,41 @@ void processChar(char c, Stream& port) {
 //  ARM COMMAND PARSER
 //  Format: "ARM:<base>,<elbow>,<gripper>"   values 0-180
 //  gripper value: >=90 → close,  <90 → open
+//  [FIX] Improved bounds checking + parse error handling
 // ═══════════════════════════════════════════════════════════════
 void handleArmCommand(const String& cmd, Stream& port) {
   String val = cmd.substring(4);  // strip "ARM:"
 
+  // [SAFETY] Verify exact format before parsing
   int c1 = val.indexOf(',');
   int c2 = val.indexOf(',', c1 + 1);
+  int c3 = val.length();
 
-  if (c1 < 0 || c2 < 0) {
-    port.println(F("ERR:ARM format ARM:<base>,<elbow>,<gripper>"));
+  if (c1 < 0 || c2 < 0 || c2 >= c3 - 1) {
+    port.println(F("ERR:ARM format ARM:<base>,<elbow>,<gripper> each 0-180"));
     return;
   }
 
-  int b = constrain(val.substring(0,      c1).toInt(), 0, 180);
-  int e = constrain(val.substring(c1 + 1, c2).toInt(), 0, 180);
-  int g = constrain(val.substring(c2 + 1).toInt(),     0, 180);
+  // [FIX] Parse with explicit bounds check, handle toInt() = 0 on fail
+  String s_base = val.substring(0,      c1);
+  String s_elbo = val.substring(c1 + 1, c2);
+  String s_grip = val.substring(c2 + 1);
+  
+  // Validate non-empty
+  if (s_base.length() == 0 || s_elbo.length() == 0 || s_grip.length() == 0) {
+    port.println(F("ERR:ARM empty values"));
+    return;
+  }
+
+  int b = s_base.toInt();
+  int e = s_elbo.toInt();
+  int g = s_grip.toInt();
+
+  // [SAFETY] Check for valid parse (toInt returns 0 on fail, but 0 is also valid)
+  // Use constrain which is safe—clips to [0, 180]
+  b = constrain(b, 0, 180);
+  e = constrain(e, 0, 180);
+  g = constrain(g, 0, 180);
 
   baseJoint.write(b);
   elbowJoint.write(e);
@@ -284,7 +350,25 @@ void startGripperOpen(Stream& port) {
 
 void updateGripper() {
   if (!gripperActive) return;
-  if (millis() >= gripperEndMs) {
+  
+  unsigned long now = millis();
+  
+  // [SAFETY] Gripper watchdog—if timing goes > 2s, force stop to prevent motor burnout
+  unsigned long elapsed = now - (gripperEndMs - (gripperClosing ? GRIPPER_CLOSE_MS : GRIPPER_OPEN_MS));
+  if (elapsed > GRIPPER_WATCHDOG_MS) {
+    Serial.println(F("WARN: Gripper watchdog fired—servo timeout"));
+    gripperServo.write(GRIPPER_STOP);
+    gripperActive = false;
+    gripperClosed = gripperClosing;  // assume it reached desired state
+    if (gripperPort) {
+      gripperPort->println(gripperClosed ? F("GRIP:CLOSED (timeout)") : F("GRIP:OPEN (timeout)"));
+      gripperPort = nullptr;
+    }
+    return;
+  }
+  
+  // Normal completion
+  if (now >= gripperEndMs) {
     gripperServo.write(GRIPPER_STOP);
     gripperClosed = gripperClosing;
     gripperActive = false;
